@@ -1,0 +1,1 @@
+{"architectures": ["ElectraForPreTraining"], "model_type": "electra", "max_position_embeddings": 514, "vocab_size": 32000}

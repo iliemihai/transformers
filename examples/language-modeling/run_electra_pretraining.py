@@ -43,13 +43,13 @@ from transformers import (
     EvalPrediction,
     HfArgumentParser,
     PreTrainedTokenizer,
-    TextDataset,
     Trainer,
     set_seed,
 )
+from electra_dataset import LineByLineTextDataset
 from transformers.modeling_utils import PreTrainedModel
 from transformers.training_args import TrainingArguments
-
+from electra_tokenizer import ElectROTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +194,7 @@ def get_dataset(
         return OpenWebTextDataset(data_args, model_args, overwrite_cache=should_overwrite_cache)
     else:
         file_path = data_args.eval_data_file if evaluate else data_args.train_data_file
-        return TextDataset(
+        return LineByLineTextDataset(
             tokenizer=tokenizer, file_path=file_path, block_size=data_args.block_size, local_rank=local_rank,
         )
 
@@ -392,8 +392,9 @@ class CombinedModel(nn.Module):
     def gather_positions(sequence, positions):
         batch_size, sequence_length, dimension = sequence.shape
         position_shift = (sequence_length * torch.arange(batch_size, device=sequence.device)).unsqueeze(-1)
-        flat_positions = torch.view(positions + position_shift, [-1]).long()
-        flat_sequence = torch.view(sequence, [batch_size * sequence_length, dimension])
+
+        flat_positions = (positions + position_shift).long().view([-1])
+        flat_sequence = sequence.view([batch_size * sequence_length, dimension])
         gathered = flat_sequence.index_select(0, flat_positions)
         return torch.reshape(gathered, [batch_size, -1, dimension])
 
@@ -415,12 +416,12 @@ class CombinedModel(nn.Module):
 
         # Of the evaluated tokens, 15% of those will keep their original tokens
         replace_with_mask_positions = torch.rand_like(
-            masked_lm_positions,
+            masked_lm_positions.float(),
             device=masked_lm_positions.device
         ) < (1 - self.mask_probability)
 
         # Scatter the masks at the masked positions
-        masked_lm_inputs.scatter_(-1, replace_with_mask_positions, masked_tokens)
+        masked_lm_inputs.scatter_(-1, replace_with_mask_positions.long(), masked_tokens)
         masked_lm_inputs[..., 0] = 101
 
         generator_loss, generator_output = self.generator(
@@ -554,7 +555,7 @@ def main():
         raise ValueError("Either --generator_config_name or --generator_name_or_path should be specified.")
 
     if model_args.tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.tokenizer_name, cache_dir=model_args.cache_dir)
+        tokenizer = ElectROTokenizer(os.path.join(model_args.tokenizer_name, "vocab.txt"))
     elif model_args.discriminator_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.discriminator_name_or_path, cache_dir=model_args.cache_dir

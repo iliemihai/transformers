@@ -1,0 +1,2 @@
+{"architectures": ["ElectraForMaskedLM"], "max_position_embeddings": 514, "model_type": "electra", "vocab_size": 32000}
+
