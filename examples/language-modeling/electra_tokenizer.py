@@ -2,9 +2,6 @@ from transformers.tokenization_utils import PreTrainedTokenizer, PreTrainedToken
 from tokenizers import BertWordPieceTokenizer
 
 class ElectROTokenizer(PreTrainedTokenizerFast):
-    """
-    Constructs an Electra BPE tokenizer (backed by HuggingFace's `tokenizers` library).
-    """
 
     def __init__(
         self,
