@@ -20,8 +20,12 @@ class LineByLineTextDataset(Dataset):
         
         logger.info("Reading file %s", file_path)
 
+        # RAM bottleneck
         with open(file_path, encoding="utf-8") as f:
             lines = [line for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
+
+        logger.info("Tokenize to 512 size")
+        tokenizer._tokenizer.enable_truncation(max_length=512)
 
         logger.info("Running tokenization")
         self.examples = tokenizer._tokenizer.encode_batch(lines)
