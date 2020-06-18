@@ -1,4 +1,5 @@
 import os
+import mmap
 import logging
 import numpy as np
 import torch
@@ -14,25 +15,38 @@ from electra_tokenizer import ElectROTokenizer
 
 logger = logging.getLogger(__name__)
 
+def remove_brackets(tok):
+    tok=tok.replace("[","").replace("]","")
+    return tok
+
+def my_collate(batch):
+    batch = filter(lambda x: x is not None, batch)
+    return DataLoader.default_collate(list(batch))
+
 class LineByLineTextDataset(Dataset):
     def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str, block_size=512, local_rank=-1):
         assert os.path.isfile(file_path)
         
         logger.info("Reading file %s", file_path)
 
-        # RAM bottleneck
+        # Memory mapping improves I/O performances because it does not involve a separate system
+        # call for each access. The same memory is accessed in both kernel and user space
         with open(file_path, encoding="utf-8") as f:
-            lines = [line for line in f.read().splitlines() if (len(line) > 0 and not line.isspace())]
+            self.mmap_file = mmap.mmap(f.fileno(), length=0, access=mmap.ACCESS_READ)
+            self.offsets = [0]
+            for line in iter(self.mmap_file.readline, b""):
+                self.offsets.append(self.mmap_file.tell())
 
-        logger.info("Tokenize to 512 size")
-        tokenizer._tokenizer.enable_truncation(max_length=512)
-
-        logger.info("Running tokenization")
-        self.examples = tokenizer._tokenizer.encode_batch(lines)
-        
     def __len__(self):
-        return len(self.examples)
+        return len(self.offsets)
 
     def __getitem__(self, i):
-        return torch.tensor(self.examples[i].ids, dtype=torch.long)
+        strtoks = list(map(remove_brackets, self.mmap_file[self.offsets[i]:self.offsets[i+1]].decode().split(", ")))
+        #convert list of strings to list of integers
+        inttoks = list(map(int, strtoks))
+        if len(inttoks) > 512:
+            print("MAI MARE LA INDEX", i, len(inttoks), inttoks)
+        #    inttoks=inttoks[:512]
+        #    inttoks[511]=3
+        return torch.tensor(inttoks, dtype=torch.long)
 
