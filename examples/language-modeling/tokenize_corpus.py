@@ -7,8 +7,8 @@ from electra_tokenizer import ElectROTokenizer
 logging.basicConfig(level=logging.DEBUG)
 
 VOCAB_PATH = "./ElectraConfig"
-IN_PATH = "./corpus/test.txt"
-OUT_PATH = "./corpus/new_encoded_test.txt"
+IN_PATH = "./corpus/ro_train.txt"
+OUT_PATH = "./corpus/encoded_ro_train.txt"
 BLOCK_SIZE = 512
 
 def blocks(files, size=65536):
