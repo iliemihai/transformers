@@ -15,7 +15,6 @@
 # limitations under the License.
 """
 Pre-training/Fine-tuning the library models for causal language modeling (GPT, GPT-2, CTRL, ...) on a text file or a dataset.
-
 Here is the full list of checkpoints on the hub that can be fine-tuned by this script:
 https://huggingface.co/models?filter=causal-lm
 """
@@ -29,12 +28,15 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+import json
+import shutil
 
 import datasets
 from datasets import Dataset, load_dataset
 from tqdm import tqdm
 
 import jax
+import jax.profiler
 import jax.numpy as jnp
 import optax
 import transformers
@@ -42,6 +44,7 @@ from flax import jax_utils, traverse_util
 from flax.jax_utils import unreplicate
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard, shard_prng_key
+from flax.serialization import to_bytes, from_bytes
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_CAUSAL_LM_MAPPING,
@@ -54,6 +57,7 @@ from transformers import (
 )
 from transformers.testing_utils import CaptureLogger
 
+from importlib.util import find_spec
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +158,10 @@ class DataTrainingArguments:
         default=None,
         metadata={"help": "The number of processes to use for the preprocessing."},
     )
+    text_column_name: Optional[str] = field(
+            default='text',
+            metadata={"help": "Column containing main text data."},
+        )
 
     def __post_init__(self):
         if self.dataset_name is None and self.train_file is None and self.validation_file is None:
@@ -161,10 +169,10 @@ class DataTrainingArguments:
         else:
             if self.train_file is not None:
                 extension = self.train_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, a json or a txt file."
+                assert extension in ["csv", "json", "txt", "arrow"], "`train_file` should be a csv, a json or a txt file."
             if self.validation_file is not None:
                 extension = self.validation_file.split(".")[-1]
-                assert extension in ["csv", "json", "txt"], "`validation_file` should be a csv, a json or a txt file."
+                assert extension in ["csv", "json", "txt", "arrow"], "`validation_file` should be a csv, a json or a txt file."
 
 
 class TrainState(train_state.TrainState):
@@ -226,6 +234,53 @@ def create_learning_rate_fn(
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
 
+# utils
+def mb_item(x):
+    return x.item() if hasattr(x, "item") else x
+
+#checkpoint functions
+def save_checkpoint(model, save_dir, state, with_opt:bool=True, push_to_hub:bool=False):
+    state = jax_utils.unreplicate(state)
+    print(f"SAVING CHECKPOINT IN {save_dir}", end=" ... ")
+    save_dir = f"{save_dir}/ckpt-{mb_item(state.step)-1}"
+    model.save_pretrained(
+        save_dir,
+        params=state.params,
+        push_to_hub=push_to_hub,
+        commit_message=f"Saving weights and logs at step {mb_item(state.step)}",
+    )
+    if with_opt:
+        with open(os.path.join(save_dir, "opt_state.msgpack"), "wb") as f:
+            f.write(to_bytes(state.opt_state))
+        with open(os.path.join(save_dir, "training_state.json"), "w") as f:
+            json.dump({"step": state.step.item()}, f)
+    print("checkpoint saved")
+        
+def restore_checkpoint(save_dir, state):
+    print(f"RESTORING CHECKPOINT FROM {save_dir}", end=" ... ")
+    with open(os.path.join(save_dir, "flax_model.msgpack"), "rb") as f:
+        params = from_bytes(state.params, f.read())
+
+    with open(os.path.join(save_dir, "opt_state.msgpack"), "rb") as f:
+        opt_state = from_bytes(state.opt_state, f.read())
+
+    with open(os.path.join(save_dir, "training_state.json"), "r") as f:
+        training_state = json.load(f)
+    step = training_state["step"]
+
+    print("checkpoint restored")
+    return state.replace(step=step, params=params, opt_state=opt_state), step
+
+def rotate_checkpoints(ckpt_dir:str, save_total_limit:int):
+    "Removes older checkpoints so that `save_total_limit` checkpoints are kept"
+    # TODO: what to remove is decided using step number only, we might want to improve that
+    ckpts = [str(x) for x in Path(ckpt_dir).glob("ckpt-*")]
+    # sort checkpoints by step
+    ckpts_sorted = sorted(ckpts, key=lambda x: int(x.split('-')[-1]))
+    ckpts_to_delete = ckpts_sorted[:-save_total_limit]
+    for ckpt in ckpts_to_delete:
+        logger.info(f"Deleting older checkpoint [{ckpt}] due to save_total_limit ({save_total_limit})")
+        shutil.rmtree(ckpt)
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -246,7 +301,7 @@ def main():
         and training_args.do_train
         and not training_args.overwrite_output_dir
     ):
-        raise ValueError(
+        print(
             f"Output directory ({training_args.output_dir}) already exists and is not empty."
             "Use --overwrite_output_dir to overcome."
         )
@@ -306,7 +361,10 @@ def main():
         extension = data_args.train_file.split(".")[-1]
         if extension == "txt":
             extension = "text"
-        dataset = load_dataset(extension, data_files=data_files, cache_dir=model_args.cache_dir)
+        dataset_train = Dataset.from_file(data_args.train_file) 
+        #dataset_train = dataset_train.select(range(200000))
+        dataset_valid = Dataset.from_file(data_args.validation_file)
+        #dataset_valid = dataset_valid.select(range(1000))
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -349,10 +407,10 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
-        column_names = dataset["train"].column_names
+        column_names = dataset_train.column_names
     else:
-        column_names = dataset["validation"].column_names
-    text_column_name = "text" if "text" in column_names else column_names[0]
+        column_names = dataset_valid.column_names
+    text_column_name = data_args.text_column_name if data_args.text_column_name in column_names else column_names[0]
 
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
     tok_logger = transformers.utils.logging.get_logger("transformers.tokenization_utils_base")
@@ -367,7 +425,14 @@ def main():
             )
         return output
 
-    tokenized_datasets = dataset.map(
+    tokenized_datasets_train = dataset_train.map(
+        tokenize_function,
+        batched=True,
+        num_proc=data_args.preprocessing_num_workers,
+        remove_columns=column_names,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
+    tokenized_datasets_valid = dataset_valid.map(
         tokenize_function,
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
@@ -414,7 +479,13 @@ def main():
     # To speed up this part, we use multiprocessing. See the documentation of the map method for more information:
     # https://huggingface.co/docs/datasets/package_reference/main_classes.html#datasets.Dataset.map
 
-    lm_datasets = tokenized_datasets.map(
+    lm_datasets_train = tokenized_datasets_train.map(
+        group_texts,
+        batched=True,
+        num_proc=data_args.preprocessing_num_workers,
+        load_from_cache_file=not data_args.overwrite_cache,
+    )
+    lm_datasets_valid = tokenized_datasets_valid.map(
         group_texts,
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
@@ -422,16 +493,12 @@ def main():
     )
 
     if training_args.do_train:
-        if "train" not in tokenized_datasets:
-            raise ValueError("--do_train requires a train dataset")
-        train_dataset = lm_datasets["train"]
+        train_dataset = lm_datasets_train
         if data_args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(data_args.max_train_samples))
 
     if training_args.do_eval:
-        if "validation" not in tokenized_datasets:
-            raise ValueError("--do_eval requires a validation dataset")
-        eval_dataset = lm_datasets["validation"]
+        eval_dataset = lm_datasets_valid
         if data_args.max_eval_samples is not None:
             eval_dataset = eval_dataset.select(range(data_args.max_eval_samples))
 
@@ -452,6 +519,24 @@ def main():
             "Unable to display metrics through TensorBoard because the package is not installed: "
             "Please run pip install tensorboard to enable."
         )
+    
+    # enable wandb tracking
+    has_wandb = find_spec("wandb") is not None 
+    if jax.process_index() == 0 and has_wandb and ("wandb" in training_args.report_to):
+        try:
+            import wandb
+            wandb.init(
+                entity="wandb", 
+                project="hf-flax-gpt-neo-copilot",
+                sync_tensorboard=True
+            )
+            wandb.config.update(training_args)
+            wandb.config.update(model_args)
+            wandb.config.update(data_args)
+        except ImportError as e:
+            print(e)
+            has_wandb = False
+    
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -459,7 +544,7 @@ def main():
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
-    train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
+    train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count() * training_args.gradient_accumulation_steps
     eval_batch_size = int(training_args.per_device_eval_batch_size) * jax.device_count()
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
@@ -488,7 +573,7 @@ def main():
         }
         return traverse_util.unflatten_dict(flat_mask)
 
-    # create adam optimizer
+    # create optimizer
     if training_args.adafactor:
         # We use the default parameters here to initialize adafactor,
         # For more details about the parameters please check https://github.com/deepmind/optax/blob/ed02befef9bf81cbbf236be3d2b0e032e9ed4a40/optax/_src/alias.py#L74
@@ -504,9 +589,17 @@ def main():
             weight_decay=training_args.weight_decay,
             mask=decay_mask_fn,
         )
+    if training_args.gradient_accumulation_steps > 1:
+        optimizer = optax.MultiSteps(optimizer, training_args.gradient_accumulation_steps)
+    grad_accum_steps = training_args.gradient_accumulation_steps
 
     # Setup train state
     state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=optimizer, dropout_rng=dropout_rng)
+    
+    if training_args.resume_from_checkpoint:
+        state, resume_step = restore_checkpoint(training_args.resume_from_checkpoint, state)
+    else:
+        resume_step = 0
 
     def loss_fn(logits, labels):
         shift_logits = logits[..., :-1, :]
@@ -530,7 +623,7 @@ def main():
 
         new_state = state.apply_gradients(grads=grad, dropout_rng=new_dropout_rng)
 
-        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
+        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step // grad_accum_steps)}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
 
         return new_state, metrics
@@ -557,11 +650,15 @@ def main():
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {num_epochs}")
     logger.info(f"  Instantaneous batch size per device = {training_args.per_device_train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel & distributed) = {train_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, distributed and grad_accum) = {train_batch_size}")
     logger.info(f"  Total optimization steps = {total_train_steps}")
+
+    if not training_args.skip_memory_metrics:
+        server = jax.profiler.start_server(9999)
 
     train_time = 0
     train_metrics = []
+    # TODO: figure out training duration
     epochs = tqdm(range(num_epochs), desc=f"Epoch ... (1/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
@@ -571,22 +668,33 @@ def main():
         rng, input_rng = jax.random.split(rng)
 
         # Generate an epoch by shuffling sampling indices from the train dataset
-        train_loader = data_loader(input_rng, train_dataset, train_batch_size, shuffle=True)
+        train_loader = data_loader(input_rng, train_dataset, train_batch_size // grad_accum_steps, shuffle=True)
         steps_per_epoch = len(train_dataset) // train_batch_size
         # train
-        for step in tqdm(range(steps_per_epoch), desc="Training...", position=1, leave=False):
+        steps_trained_progress_bar = tqdm(range(steps_per_epoch), desc="Training...", position=1,
+                                          leave=False, initial=(resume_step // grad_accum_steps))
+        for step in range(steps_per_epoch * grad_accum_steps):
+            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
+            # skip to the step from which we are resuming
+            if cur_step < resume_step:
+                continue
+
             batch = next(train_loader)
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
+            if step % grad_accum_steps == 0:
+                steps_trained_progress_bar.update(1)
 
-            cur_step = epoch * (len(train_dataset) // train_batch_size) + step
-
-            if cur_step % training_args.logging_steps == 0 and cur_step > 0:
+            if cur_step % (training_args.logging_steps * grad_accum_steps)== 0 and cur_step > 0:
                 # Save metrics
                 train_metric = unreplicate(train_metric)
                 train_time += time.time() - train_start
                 if has_tensorboard and jax.process_index() == 0:
                     write_train_metric(summary_writer, train_metrics, train_time, cur_step)
+                if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
+                    # TODO: add accumulation of metrics
+                    _metrics = {k if k=="learning_rate" else f"train_{k}":mb_item(v.mean()) for k, v in train_metric.items()}
+                    wandb.log({"training_step":cur_step, **_metrics}, commit=True)
 
                 epochs.write(
                     f"Step... ({cur_step} | Loss: {train_metric['loss'].mean()}, Learning Rate: {train_metric['learning_rate'].mean()})"
@@ -594,7 +702,7 @@ def main():
 
                 train_metrics = []
 
-            if cur_step % training_args.eval_steps == 0 and cur_step > 0:
+            if cur_step % (training_args.eval_steps * grad_accum_steps) == 0 and cur_step > 0:
                 # ======================== Evaluating ==============================
                 eval_metrics = []
                 eval_loader = data_loader(input_rng, eval_dataset, eval_batch_size)
@@ -621,19 +729,19 @@ def main():
 
                 # Save metrics
                 if has_tensorboard and jax.process_index() == 0:
-                    cur_step = epoch * (len(train_dataset) // train_batch_size)
+                    # cur_step = epoch * (len(train_dataset) // train_batch_size)
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
+                if has_wandb and jax.process_index() == 0 and ("wandb" in training_args.report_to):
+                    _metrics = {f"eval_{k}":mb_item(v) for k, v in eval_metrics.items()}
+                    wandb.log({"eval_step":cur_step, **_metrics})
 
-            if cur_step % training_args.save_steps == 0 and cur_step > 0:
+            if cur_step % (training_args.save_steps * grad_accum_steps) == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
                 if jax.process_index() == 0:
-                    params = jax.device_get(unreplicate(state.params))
-                    model.save_pretrained(
-                        training_args.output_dir,
-                        params=params,
-                        push_to_hub=training_args.push_to_hub,
-                        commit_message=f"Saving weights and logs of step {cur_step}",
-                    )
+                    save_checkpoint(model, training_args.output_dir+"_"+str(cur_step), state, push_to_hub=training_args.push_to_hub)
+                    rotate_checkpoints(training_args.output_dir, training_args.save_total_limit)
+
+
 
 
 if __name__ == "__main__":
