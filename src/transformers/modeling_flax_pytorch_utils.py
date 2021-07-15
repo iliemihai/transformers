@@ -34,7 +34,9 @@ logger = logging.get_logger(__name__)
 #####################
 # PyTorch => Flax #
 #####################
+import tensorflow as tf
 
+bfloat16 = tf.bfloat16.as_numpy_dtype
 
 def load_pytorch_checkpoint_in_flax_state_dict(flax_model, pytorch_checkpoint_path, allow_missing_keys=False):
     """Load pytorch checkpoints in a flax model"""
@@ -198,6 +200,7 @@ def load_flax_weights_in_pytorch_model(pt_model, flax_state):
             else:
                 # add weight to pytorch dict
                 flax_tensor = np.asarray(flax_tensor) if not isinstance(flax_tensor, np.ndarray) else flax_tensor
+                print("FLAX TENSOR", flax_tensor.dtype, flax_key)
                 pt_model_dict[flax_key] = torch.from_numpy(flax_tensor)
                 # remove from missing keys
                 missing_keys.remove(flax_key)

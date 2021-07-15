@@ -43,6 +43,7 @@ import transformers
 from flax import jax_utils, traverse_util
 from flax.jax_utils import unreplicate
 from flax.training import train_state
+from flax.training.checkpoints import save_checkpoint, restore_checkpoint
 from flax.training.common_utils import get_metrics, onehot, shard, shard_prng_key
 from flax.serialization import to_bytes, from_bytes
 from transformers import (
@@ -239,25 +240,26 @@ def mb_item(x):
     return x.item() if hasattr(x, "item") else x
 
 #checkpoint functions
-def save_checkpoint(model, save_dir, state, with_opt:bool=True, push_to_hub:bool=False):
+def save_model_checkpoint(model, save_dir, state, with_opt:bool=False, push_to_hub:bool=False, **kwargs):
     state = jax_utils.unreplicate(state)
-    print(f"SAVING CHECKPOINT IN {save_dir}", end=" ... ")
+    logger.info(f"SAVING CHECKPOINT IN {save_dir}...")
     save_dir = f"{save_dir}/ckpt-{mb_item(state.step)-1}"
     model.save_pretrained(
         save_dir,
         params=state.params,
         push_to_hub=push_to_hub,
-        commit_message=f"Saving weights and logs at step {mb_item(state.step)}",
+        commit_message=f"Saving weights and logs at step {mb_item(state.step)-1}",
+        **kwargs
     )
     if with_opt:
         with open(os.path.join(save_dir, "opt_state.msgpack"), "wb") as f:
             f.write(to_bytes(state.opt_state))
         with open(os.path.join(save_dir, "training_state.json"), "w") as f:
             json.dump({"step": state.step.item()}, f)
-    print("checkpoint saved")
+    logger.info("checkpoint saved")
         
-def restore_checkpoint(save_dir, state):
-    print(f"RESTORING CHECKPOINT FROM {save_dir}", end=" ... ")
+def restore_model_checkpoint(save_dir, state):
+    logger.info(f"RESTORING CHECKPOINT FROM {save_dir}...")
     with open(os.path.join(save_dir, "flax_model.msgpack"), "rb") as f:
         params = from_bytes(state.params, f.read())
 
@@ -268,7 +270,7 @@ def restore_checkpoint(save_dir, state):
         training_state = json.load(f)
     step = training_state["step"]
 
-    print("checkpoint restored")
+    logger.info("checkpoint restored")
     return state.replace(step=step, params=params, opt_state=opt_state), step
 
 def rotate_checkpoints(ckpt_dir:str, save_total_limit:int):
@@ -281,6 +283,7 @@ def rotate_checkpoints(ckpt_dir:str, save_total_limit:int):
     for ckpt in ckpts_to_delete:
         logger.info(f"Deleting older checkpoint [{ckpt}] due to save_total_limit ({save_total_limit})")
         shutil.rmtree(ckpt)
+
 
 def main():
     # See all possible arguments in src/transformers/training_args.py
@@ -361,10 +364,8 @@ def main():
         extension = data_args.train_file.split(".")[-1]
         if extension == "txt":
             extension = "text"
-        dataset_train = Dataset.from_file(data_args.train_file) 
-        #dataset_train = dataset_train.select(range(200000))
-        dataset_valid = Dataset.from_file(data_args.validation_file)
-        #dataset_valid = dataset_valid.select(range(1000))
+        dataset_train = load_dataset("text", data_files=data_args.train_file)#Dataset.from_file(data_args.train_file)
+        dataset_valid = load_dataset("text", data_files=data_args.validation_file)#Dataset.from_file(data_args.validation_file)
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
@@ -407,9 +408,9 @@ def main():
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     if training_args.do_train:
-        column_names = dataset_train.column_names
+        column_names = dataset_train["train"].column_names
     else:
-        column_names = dataset_valid.column_names
+        column_names = dataset_valid["train"].column_names
     text_column_name = data_args.text_column_name if data_args.text_column_name in column_names else column_names[0]
 
     # since this will be pickled to avoid _LazyModule error in Hasher force logger loading before tokenize_function
@@ -425,14 +426,14 @@ def main():
             )
         return output
 
-    tokenized_datasets_train = dataset_train.map(
+    tokenized_datasets_train = dataset_train["train"].map(
         tokenize_function,
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
         remove_columns=column_names,
         load_from_cache_file=not data_args.overwrite_cache,
     )
-    tokenized_datasets_valid = dataset_valid.map(
+    tokenized_datasets_valid = dataset_valid["train"].map(
         tokenize_function,
         batched=True,
         num_proc=data_args.preprocessing_num_workers,
@@ -738,8 +739,15 @@ def main():
             if cur_step % (training_args.save_steps * grad_accum_steps) == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
                 if jax.process_index() == 0:
-                    save_checkpoint(model, training_args.output_dir+"_"+str(cur_step), state, push_to_hub=training_args.push_to_hub)
-                    rotate_checkpoints(training_args.output_dir, training_args.save_total_limit)
+                    save_model_checkpoint(model, training_args.output_dir, state, with_opt=False,
+                                      push_to_hub=training_args.push_to_hub, repo_name_or_path=training_args.output_dir)
+                    # this saves full state including optimizer
+                    save_checkpoint(training_args.output_dir, state, state.step, keep=training_args.save_total_limit, overwrite=False)
+                    if training_args.save_total_limit is not None:
+                        rotate_checkpoints(training_args.output_dir, training_args.save_total_limit)
+    
+    # save model after training is over
+    save_model_checkpoint(model, training_args.output_dir, state, with_opt=False, push_to_hub=training_args.push_to_hub)
 
 
 
